@@ -1,0 +1,50 @@
+[
+  {
+    "case": "EXP1_local_ls",
+    "group": "exp1",
+    "desc": "Local learning averaged across 3 clients under LS split.",
+    "config": "configs/exp_design_ls/EXP1_local_ls.json"
+  },
+  {
+    "case": "EXP1_fedavg_ls",
+    "group": "exp1",
+    "desc": "FedAvg baseline under LS split.",
+    "config": "configs/exp_design_ls/EXP1_fedavg_ls.json"
+  },
+  {
+    "case": "EXP1_fedprox_ls",
+    "group": "exp1",
+    "desc": "FedProx(mu=0.001) under LS split.",
+    "config": "configs/exp_design_ls/EXP1_fedprox_ls.json"
+  },
+  {
+    "case": "EXP1_fededa_ls",
+    "group": "exp1",
+    "desc": "FedEDA(size+p) under LS split.",
+    "config": "configs/exp_design_ls/EXP1_fededa_ls.json"
+  },
+  {
+    "case": "EXP2_fededa_size_ls",
+    "group": "exp2",
+    "desc": "Metadata ablation: size only under LS split.",
+    "config": "configs/exp_design_ls/EXP2_fededa_size_ls.json"
+  },
+  {
+    "case": "EXP2_fededa_p_ls",
+    "group": "exp2",
+    "desc": "Metadata ablation: p only under LS split.",
+    "config": "configs/exp_design_ls/EXP2_fededa_p_ls.json"
+  },
+  {
+    "case": "EXP3_fededa_size_p_nopart_ls",
+    "group": "exp3",
+    "desc": "Partition ablation: no partition (sub_graph_size=0) + FedEDA(size+p), LS split.",
+    "config": "configs/exp_design_ls/EXP3_fededa_size_p_nopart_ls.json"
+  },
+  {
+    "case": "EXP3_fededa_size_p_part_ls",
+    "group": "exp3",
+    "desc": "Partition ablation: partition (sub_graph_size=50000) + FedEDA(size+p), LS split.",
+    "config": "configs/exp_design_ls/EXP3_fededa_size_p_part_ls.json"
+  }
+]

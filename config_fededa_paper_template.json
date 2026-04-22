@@ -1,0 +1,58 @@
+{
+  "basic": {
+    "arch": "fededa"
+  },
+  "train": {
+    "num_clients": 3,
+    "num_select": 0,
+    "local_epochs": 2,
+    "epochs": 10000,
+    "lr": 0.0001,
+    "parallel": false,
+    "prerout": {
+      "fededa_task_profile": "paper",
+      "paper_tasks": {
+        "drv": {
+          "label_key": "n_drv",
+          "task_type": "classification"
+        },
+        "rc": {
+          "label_key": "n_rc",
+          "task_type": "regression"
+        },
+        "wl": {
+          "label_key": "n_wl",
+          "task_type": "regression"
+        }
+      },
+
+      "circuits_json_path": "/root/autodl-tmp/Fededa-PreRout/data/datasets/cir-json/circuits-8rat.json",
+      "data_split_json_path": "/root/autodl-tmp/Fededa-PreRout/data/datasets/cir-json/data_split-8rat-tvt-712-fixed.json",
+
+      "model_type": "PreRoutGNN",
+      "dropout": 0.0,
+      "device": "cuda",
+      "move_to_cuda_in_advance": false,
+      "sub_graph_size": 50000,
+      "finetune_graph_autoencoder": false,
+
+      "predict_slew": false,
+      "predict_netdelay": true,
+      "predict_celldelay": false,
+
+      "fededa_gamma_size": 0.1,
+      "fededa_gamma_sigma": 0.001,
+      "fededa_gamma_p": 0.001,
+      "fededa_alpha_clip_max": 10.0,
+      "fededa_lambda_reduce": "mean",
+      "fededa_drift_normalize": true,
+      "fedavg_aggregation_mode": "equal",
+      "client_data_split_strategy": "group_by_parent_circuit",
+      "return_val_split": true,
+      "train_val_test_ratio": [7, 1, 2],
+      "train_val_test_seed": 3407,
+      "train_val_test_group_by_parent": true,
+      "train_val_test_repartition_from_all": false
+    }
+  }
+}

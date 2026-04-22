@@ -1,0 +1,20 @@
+# python
+__pycache__/
+.___pycache__/
+*.pyc
+
+# mac
+.DS_Store
+._*
+
+# vscode
+.vscode/
+.idea/
+
+# project
+datasets/
+results/
+satellite/
+training.log
+# large datasets
+data/datasets/

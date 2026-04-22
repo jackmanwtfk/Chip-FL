@@ -1,0 +1,21 @@
+{
+    "basic": {
+        "arch": "sl",
+        "host_ip" : "127.0.0.1",
+        "host_port" : 9000
+    },
+    "train": {
+        "dataset": "fmnist",
+        "model_name": "lenet",
+        "optimizer": "adam",
+        "epochs": 3,
+        "local_epochs": 10,
+        "batch_size": 64,
+        "lr": 0.001,
+        "momentum": 0.9,
+        "num_clients": 5,
+        "num_select": 0,
+        "cut_layer": 3,
+        "parallel": false
+    }
+}
