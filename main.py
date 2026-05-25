@@ -25,8 +25,6 @@ def main(config_path="/root/autodl-tmp/Fed-Learning/Fed-Learning/config_prerout.
         trainer = AmpereTrainer(**train_params)
     elif arch == 'prerout_fl':
         trainer = PreRoutFedTrainer(**train_params)
-    elif arch == 'fededa':
-        trainer = FedEDATrainer(**train_params)
     else:  # no arch
         print("Who?")
         exit()

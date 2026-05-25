@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Compute FedEDA circuit metadata (size, Rent p, sigma) from gate-level Verilog.
+"""从门级 Verilog 中计算电路元数据（size、Rent p、sigma）。
 
-Pipeline (paper-aligned intent):
-1) Parse gate-level Verilog and extract module hierarchy + cell-level connectivity.
-2) Keep standard-cell instances and drop physical-only cells (filler/tap/endcap/decap).
-3) For each submodule graph, run recursive 2-way min-cut partitioning (METIS style).
-4) Collect (N, T) points at each partition level:
-   - N: number of gates in a block
-   - T: number of cross-boundary terminals (nets crossing block boundary)
-5) Fit log(T) = log(k) + p_i * log(N) for each submodule.
-6) Circuit-level metadata:
-   - p = weighted mean of p_i (weighted by submodule occurrence count)
-   - sigma = weighted std of p_i
-   - size = number of cell instances (prefer external size CSV if provided)
+流程：
+1) 解析门级 Verilog，提取模块层次结构和单元级连通关系。
+2) 保留标准单元实例，过滤 physical-only 单元（如 filler/tap/endcap/decap）。
+3) 对每个子模块图执行递归二路最小割划分（类似 METIS 风格）。
+4) 在每一层划分中收集 (N, T) 点：
+   - N：分块中的门数量
+   - T：跨越分块边界的 terminal 数量（即跨边界的 net）
+5) 对每个子模块拟合 log(T) = log(k) + p_i * log(N)。
+6) 生成电路级元数据：
+   - p = p_i 的加权平均值（权重为子模块出现次数）
+   - sigma = p_i 的加权标准差
+   - size = 单元实例数量（若提供外部 size CSV，则优先使用）
 
-Notes:
-- This script uses `pyverilog` for parsing and `pymetis` for min-cut partitioning.
-- For flattened netlists (single module), the top module is the only submodule source.
+说明：
+- 本脚本使用 `pyverilog` 进行解析，使用 `pymetis` 进行最小割划分。
+- 对于扁平化网表（只有一个模块），顶层模块就是唯一的子模块来源。
+
+与训练代码的直接关系：
+- 本脚本是 FedEDA 的“离线预计算入口”，用于生成 design -> {size, p, sigma}。
+- 输出 JSON/CSV 会被 architecture/PreRout/client_full.py 优先读取。
+- trainer.py 在训练前调用各 client 汇总这些元数据，再计算全局复杂度范围。
 """
 
 from __future__ import annotations
@@ -79,6 +84,10 @@ NET_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*(?:\[[^\[\]]+\])?")
 
 @dataclass
 class ModuleGraph:
+    # 用于 Rent 拟合的模块图表示：
+    # - num_cells：图中单元数
+    # - node_to_nets / net_to_nodes：记录 cell 与 net 的关联
+    # - adjacency：划分算法使用的邻接表
     module_name: str
     num_cells: int
     node_to_nets: List[List[int]]
@@ -86,6 +95,9 @@ class ModuleGraph:
     adjacency: List[List[int]]
 
 
+# -------------------------------------------------
+# 一、基础工具：设计名规整、信号提取、物理单元过滤
+# -------------------------------------------------
 def normalize_design_name(name: Optional[str]) -> Optional[str]:
     if name is None:
         return None
@@ -129,7 +141,7 @@ def extract_signal_tokens(node, codegen: ASTCodeGenerator) -> Set[str]:
         name = str(getattr(node, "name", "")).strip()
         return {name} if name else set()
 
-    # Keep bit/slice expressions as distinct net tokens for better fidelity.
+    # 保留 bit/slice 形式的表达式，作为独立 net token，以提高还原精度。
     if cls in {"Pointer", "Partselect"}:
         tok = safe_to_code(node, codegen)
         return set() if looks_constant_token(tok) else {tok}
@@ -146,7 +158,7 @@ def extract_signal_tokens(node, codegen: ASTCodeGenerator) -> Set[str]:
     if cls == "Repeat":
         return extract_signal_tokens(getattr(node, "value", None), codegen)
 
-    # Generic fallback: recurse children, then fallback to rendered token.
+    # 通用回退策略：先递归子节点；若仍拿不到信号，再退化为渲染后的 token。
     out: Set[str] = set()
     has_children = False
     try:
@@ -174,6 +186,8 @@ def is_physical_only_cell(module_type: str, inst_name: str, keep_phys_only: bool
 
 
 def load_size_lookup(size_csv: str, size_column: str) -> Dict[str, float]:
+    # 读取外部 size 统计表。
+    # 训练时 client_full.py 默认也会优先读取同一份 size CSV。
     if not size_csv or not os.path.isfile(size_csv):
         return {}
     lookup: Dict[str, float] = {}
@@ -196,6 +210,9 @@ def load_size_lookup(size_csv: str, size_column: str) -> Dict[str, float]:
     return lookup
 
 
+# -------------------------------------------------
+# 二、发现输入网表，并分析层次结构
+# -------------------------------------------------
 def discover_verilog_files(netlists_root: str, pattern: str) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     if not os.path.isdir(netlists_root):
@@ -249,7 +266,7 @@ def accumulate_occurrence_counts(
     while stack:
         module_name, mult, path = stack.pop()
         if module_name in path:
-            # Defensive break for cyclic hierarchies.
+            # 防御式处理：如果层次中出现环，直接跳过，避免死循环。
             continue
         occ[module_name] += int(mult)
         children = child_counts.get(module_name, Counter())
@@ -263,6 +280,12 @@ def accumulate_occurrence_counts(
     return dict(occ)
 
 
+# -------------------------------------------------
+# 从网表提取 cell-level graph  创新
+# -------------------------------------------------
+# 这一步是后续 Rent 拟合的基础：
+# - 节点：标准单元实例
+# - 边：两个实例共享同一个 net
 def _build_graph_from_node_nets(
     module_name: str,
     node_nets_raw: List[Set[str]],
@@ -273,7 +296,7 @@ def _build_graph_from_node_nets(
     if max_cells_per_module > 0 and len(node_nets_raw) > max_cells_per_module:
         total = len(node_nets_raw)
         cap = max_cells_per_module
-        # Evenly sample to cap runtime on very large flattened modules.
+        # 对超大模块做均匀采样，控制最小割阶段的运行开销。
         picks = []
         last = -1
         for i in range(cap):
@@ -349,6 +372,9 @@ def _extract_flat_node_nets_fast(
     keep_phys_only: bool,
     ignore_power_nets: bool,
 ) -> Tuple[str, List[Set[str]]]:
+    # 扁平网表的快速解析路径：
+    # 不经过完整 AST，而是直接按实例语句提取
+    # “cell instance -> connected nets”。
     module_name = normalize_design_name(verilog_path) or "top"
     node_nets_raw: List[Set[str]] = []
 
@@ -430,6 +456,8 @@ def build_module_graph(
     max_clique_degree: int,
     max_cells_per_module: int,
 ) -> ModuleGraph:
+    # 层次化网表的 AST 解析路径：
+    # 对每个 module 提取其叶子标准单元实例，并构图。
     node_nets_raw: List[Set[str]] = []
 
     for item in getattr(module_def, "items", []) or []:
@@ -439,7 +467,7 @@ def build_module_graph(
         module_type = str(getattr(item, "module", "")).strip()
         instances = getattr(item, "instances", []) or []
 
-        # Skip hierarchical child-module instantiations; keep only leaf/library cells.
+        # 跳过层次化子模块实例，只保留叶子级/库单元实例。
         if module_type in user_modules:
             continue
 
@@ -461,6 +489,7 @@ def build_module_graph(
                     nets.add(t)
             node_nets_raw.append(nets)
 
+
     return _build_graph_from_node_nets(
         module_name=str(getattr(module_def, "name", "")),
         node_nets_raw=node_nets_raw,
@@ -469,6 +498,8 @@ def build_module_graph(
         max_cells_per_module=max_cells_per_module,
     )
 
+
+# Rent 点收集：递归二路最小割，统计 (N, T)
 
 def induced_adjacency(nodes: List[int], adjacency: List[List[int]]) -> Tuple[List[List[int]], int]:
     local_id = {n: i for i, n in enumerate(nodes)}
@@ -492,6 +523,8 @@ def count_boundary_terminals(
     node_to_nets: List[List[int]],
     net_to_nodes: List[List[int]],
 ) -> int:
+    # T 的定义：
+    # 对于一个分块，统计所有“块内有连接、块外也有连接”的 net 数量。
     inside_counts: Dict[int, int] = defaultdict(int)
     for n in part_nodes:
         for net_id in node_to_nets[n]:
@@ -510,6 +543,10 @@ def collect_rent_points(
     min_partition_size: int,
     max_depth: int,
 ) -> List[Tuple[int, int]]:
+    # 对模块图递归做二路最小割。
+    # 每一层都会为左右两个子块收集一组 (N, T)：
+    # - N：子块中的 cell 数量
+    # - T：子块对外的边界 terminal 数量
     n = graph.num_cells
     if n <= 2:
         return []
@@ -552,6 +589,9 @@ def collect_rent_points(
     return points
 
 
+# -------------------------------------------------
+# 拟合 Rent 斜率 p，并统计设计级 p 
+# -------------------------------------------------
 def fit_rent_slope(points: Sequence[Tuple[int, int]], clip_01: bool) -> Optional[float]:
     xs: List[float] = []
     ys: List[float] = []
@@ -571,6 +611,7 @@ def fit_rent_slope(points: Sequence[Tuple[int, int]], clip_01: bool) -> Optional
         return None
 
     cov_xy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    # p 即 log(T) 对 log(N) 的线性回归斜率。
     slope = cov_xy / var_x
     if clip_01:
         slope = min(1.0, max(0.0, float(slope)))
@@ -578,13 +619,12 @@ def fit_rent_slope(points: Sequence[Tuple[int, int]], clip_01: bool) -> Optional
 
 
 def instance_mean_std(vals: Sequence[Tuple[float, int]]) -> Tuple[float, float]:
-    """Paper-style mean/std over submodule instances.
+    """对子模块实例层面的 p_i 计算均值和标准差。
 
-    Equivalent to expanding each module-level p_i by its occurrence count and
-    applying:
+    可以理解为：先把每个模块级 p_i 按出现次数展开，再计算
         mu = (1/N) * sum_i p_i
         sigma = sqrt((1/N) * sum_i (p_i - mu)^2)
-    where N is total number of submodule instances.
+    其中 N 是全部子模块实例数。
     """
     total_n = sum(int(n) for _, n in vals)
     if total_n <= 0:
@@ -607,7 +647,7 @@ def parse_verilog_modules(verilog_path: str, parser: VerilogParser):
     return modules
 
 
-def compute_design_metadata(
+def compute_design_metadata( # 创新：从 Verilog 计算 p
     design_name: str,
     verilog_path: str,
     parser: VerilogParser,
@@ -615,6 +655,12 @@ def compute_design_metadata(
     size_lookup: Dict[str, float],
     args,
 ) -> Dict[str, object]:
+    # 这是单个 design 的总入口：
+    # 1) 解析网表
+    # 2) 构图
+    # 3) 收集 (N, T)
+    # 4) 拟合子模块 p_i
+    # 5) 汇总成设计级 size / p / sigma
     if bool(getattr(args, "fast_flat_parser", True)):
         try:
             top_module_name, node_nets_raw = _extract_flat_node_nets_fast(
@@ -648,6 +694,8 @@ def compute_design_metadata(
                 size_value = float(graph.num_cells)
                 size_source = "hierarchy_count"
 
+            # 扁平网表场景下，通常只有一个 top module，
+            # 所以设计级 p/sigma 直接由这个 top module 得到。
             if p_i is not None:
                 p_value, sigma_value = instance_mean_std([(float(p_i), 1)])
             else:
@@ -674,7 +722,7 @@ def compute_design_metadata(
                 ],
             }
         except Exception:
-            # Fallback to pyverilog AST parser below.
+            # 如果快速扁平解析失败，则回退到下方的 pyverilog AST 解析路径。
             if getattr(args, "verbose", False):
                 import traceback
 
@@ -712,7 +760,7 @@ def compute_design_metadata(
 
     child_counts, tops = extract_module_hierarchy(modules)
 
-    # Prefer filename-matched top when available.
+    # 优先选择与文件名匹配的顶层模块；否则使用层次分析得到的 tops。
     guessed_top = normalize_design_name(design_name)
     if guessed_top and guessed_top in modules:
         top_modules = [guessed_top]
@@ -759,7 +807,7 @@ def compute_design_metadata(
             "p_i": p_i,
         }
 
-    # Size fallback from hierarchical direct-cell counts.
+    # 如果没有外部 size CSV，就退化为层次统计得到的 cell 数。
     size_from_hierarchy = 0.0
     for module_name, report in module_reports.items():
         w = int(report["occurrence"])
@@ -790,6 +838,7 @@ def compute_design_metadata(
         used_modules += 1
         instance_pis.append((float(p_i), int(occ_w)))
 
+    # 设计级 p / sigma：对所有可用子模块的 p_i 按出现次数加权统计。
     if instance_pis:
         p_value, sigma_value = instance_mean_std(instance_pis)
     else:
@@ -818,6 +867,9 @@ def compute_design_metadata(
     }
 
 
+# -------------------------------------------------
+# 六、命令行参数：控制输入、划分深度、拟合与输出
+# -------------------------------------------------
 def parse_args(argv: Optional[Sequence[str]] = None):
     default_root = "/root/autodl-tmp/netlists"
     parser = argparse.ArgumentParser(
@@ -909,6 +961,9 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     return parser.parse_args(argv)
 
 
+# -------------------------------------------------
+# 七、结果导出：给训练侧读取的 JSON / CSV
+# -------------------------------------------------
 def _dump_outputs(
     out_json: str,
     out_csv: str,
@@ -957,6 +1012,13 @@ def _dump_outputs(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # 脚本主流程：
+    # 1) 找到待处理的网表
+    # 2) 读取 size CSV（若提供）
+    # 3) 对每个 design 计算 size / p / sigma
+    # 4) 持续写出 fededa_cm_stats.json / csv
+    #
+    # 这些输出会被 client_full.py 训练前优先加载，而不是在训练时现算。
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
@@ -964,7 +1026,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = parse_args(argv)
     if bool(getattr(args, "strict_hierarchical", False)):
-        # Strict paper mode must run module hierarchy parser.
+        # 严格论文模式下，必须走层次化解析器，不能使用扁平快速解析。
         args.fast_flat_parser = False
 
     designs_filter: Optional[Set[str]] = None

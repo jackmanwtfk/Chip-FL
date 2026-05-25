@@ -1,0 +1,110 @@
+[
+  {
+    "case": "EXP1_local_ls",
+    "split": "ls",
+    "name": "ls_Local_Test",
+    "replay_config": "configs/exp_design_ls/ls_Local_Test.json",
+    "checkpoint": "results/PreRoutFL_20260415_023641/checkpoints/latest.pt",
+    "output_dir": "results/ls_Local_Test",
+    "selector": "ls数据分割的结果/1.1 消融/1 baseline localavg"
+  },
+  {
+    "case": "EXP1_fedavg_ls",
+    "split": "ls",
+    "name": "ls_Fedavg_Test",
+    "replay_config": "configs/exp_design_ls/ls_Fedavg_Test.json",
+    "checkpoint": "results/PreRoutFL_20260415_040117/checkpoints/latest.pt",
+    "output_dir": "results/ls_Fedavg_Test",
+    "selector": "ls数据分割的结果/1.2 联邦框架对比/1 fedavg"
+  },
+  {
+    "case": "EXP1_fedprox_ls",
+    "split": "ls",
+    "name": "ls_Fedprox_Test",
+    "replay_config": "configs/exp_design_ls/ls_Fedprox_Test.json",
+    "checkpoint": "results/PreRoutFL_20260415_052520/checkpoints/latest.pt",
+    "output_dir": "results/ls_Fedprox_Test",
+    "selector": "ls数据分割的结果/1.2 联邦框架对比/2 fedprox"
+  },
+  {
+    "case": "EXP1_fededa_ls",
+    "split": "ls",
+    "name": "ls_Fededa_Test",
+    "replay_config": "configs/exp_design_ls/ls_Fededa_Test.json",
+    "checkpoint": "results/PreRoutFL_20260416_024910/checkpoints/latest.pt",
+    "output_dir": "results/ls_Fededa_Test",
+    "selector": "ls数据分割的结果/1.1 消融/4 fededa"
+  },
+  {
+    "case": "EXP2_fededa_p_ls",
+    "split": "ls",
+    "name": "ls_FededaP_Test",
+    "replay_config": "configs/exp_design_ls/ls_FededaP_Test.json",
+    "checkpoint": "results/PreRoutFL_20260415_094453/checkpoints/latest.pt",
+    "output_dir": "results/ls_FededaP_Test",
+    "selector": "ls数据分割的结果/1.1 消融/2 fededa-p"
+  },
+  {
+    "case": "EXP2_fededa_size_ls",
+    "split": "ls",
+    "name": "ls_FededaSize_Test",
+    "replay_config": "configs/exp_design_ls/ls_FededaSize_Test.json",
+    "checkpoint": "results/PreRoutFL_20260415_081812/checkpoints/latest.pt",
+    "output_dir": "results/ls_FededaSize_Test",
+    "selector": "ls数据分割的结果/1.1 消融/3 fededa-size"
+  },
+  {
+    "case": "EXP1_local_lsqs",
+    "split": "lsqs",
+    "name": "lsqs_Local_Test",
+    "replay_config": "configs/exp_design_ls+qs/lsqs_Local_Test.json",
+    "checkpoint": "results/PreRoutFL_20260414_172538/checkpoints/latest.pt",
+    "output_dir": "results/lsqs_Local_Test",
+    "selector": "ls+qs/2.1 消融/1 baseline localavg"
+  },
+  {
+    "case": "EXP1_fedavg_lsqs",
+    "split": "lsqs",
+    "name": "lsqs_Fedavg_Test",
+    "replay_config": "configs/exp_design_ls+qs/lsqs_Fedavg_Test.json",
+    "checkpoint": "results/PreRoutFL_20260414_185703/checkpoints/latest.pt",
+    "output_dir": "results/lsqs_Fedavg_Test",
+    "selector": "ls+qs/2.2 联邦框架对比/1 feddavg"
+  },
+  {
+    "case": "EXP1_fedprox_lsqs",
+    "split": "lsqs",
+    "name": "lsqs_Fedprox_Test",
+    "replay_config": "configs/exp_design_ls+qs/lsqs_Fedprox_Test.json",
+    "checkpoint": "results/PreRoutFL_20260414_202604/checkpoints/latest.pt",
+    "output_dir": "results/lsqs_Fedprox_Test",
+    "selector": "ls+qs/2.2 联邦框架对比/2 fedprox"
+  },
+  {
+    "case": "EXP1_fededa_lsqs",
+    "split": "lsqs",
+    "name": "lsqs_Fededa_Test",
+    "replay_config": "configs/exp_design_ls+qs/lsqs_Fededa_Test.json",
+    "checkpoint": "results/PreRoutFL_20260416_011832/checkpoints/latest.pt",
+    "output_dir": "results/lsqs_Fededa_Test",
+    "selector": "ls+qs/2.1 消融/4 fededa"
+  },
+  {
+    "case": "EXP2_fededa_p",
+    "split": "lsqs",
+    "name": "lsqs_FededaP_Test",
+    "replay_config": "configs/exp_design_ls+qs/lsqs_FededaP_Test.json",
+    "checkpoint": "results/PreRoutFL_20260415_011053/checkpoints/latest.pt",
+    "output_dir": "results/lsqs_FededaP_Test",
+    "selector": "ls+qs/2.1 消融/2 fededa-p"
+  },
+  {
+    "case": "EXP2_fededa_size",
+    "split": "lsqs",
+    "name": "lsqs_FededaSize_Test",
+    "replay_config": "configs/exp_design_ls+qs/lsqs_FededaSize_Test.json",
+    "checkpoint": "results/PreRoutFL_20260414_233848/checkpoints/latest.pt",
+    "output_dir": "results/lsqs_FededaSize_Test",
+    "selector": "ls+qs/2.1 消融/3 fededa-size"
+  }
+]

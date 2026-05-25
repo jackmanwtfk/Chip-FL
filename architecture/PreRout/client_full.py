@@ -1,5 +1,12 @@
-# PreRoutGNN Full Model Federated Client
-# Replicates complete PreRoutGNN training/testing flow with AT/Slew/NetDelay/CellDelay
+# PreRoutGNN 完整模型的联邦客户端实现
+# 文件定位：
+# - 这是“单个联邦客户端”的核心实现。
+# - 上游由 trainer.py 创建 client，并在每轮训练前下发全局模型状态。
+# - 下游负责：
+#   1) 用 PreRoutGNN 的 encoder + main_model 完成前向；
+#   2) 计算多任务损失与评估指标；
+#   3) 在本地训练时叠加 FedEDA / FedProx / SCAFFOLD 约束；
+#   4) 把更新后的本地模型返回给 trainer.py 聚合。
 
 import math
 import copy
@@ -9,7 +16,8 @@ import torch
 from torch.nn import functional as F
 from common import find_device, get_model_size
 
-# Import PreRoutGNN metric functions
+# 导入 PreRoutGNN 的指标函数。
+# trainer.py 负责调度联邦流程，这里负责单客户端的具体数值计算。
 import sys
 import os
 PREROUT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'PreRoutGNN'))
@@ -20,20 +28,23 @@ from metric import calc_mse, calc_r2_torch, calc_r2_flatten, calc_mae
 
 
 class PreRoutFullClient:
-    """Client for full PreRoutGNN model with encoder+main model dual architecture"""
+    """完整 PreRoutGNN 双模型结构的联邦客户端。"""
     
     def __init__(self, client_id, train_data, test_data, cfg, encoder, main_model, lr, encoder_lr=None):
+        # -------------------------------------------------
+        # 一、客户端基础状态与优化器初始化
+        # -------------------------------------------------
         self.client_id = client_id
         self.train_data = train_data
         self.test_data = test_data
         self.cfg = cfg
         self.device = find_device()
 
-        # Dual model: encoder + main PreRoutGNN model
+        # 双模型结构：encoder + PreRoutGNN 主模型
         self.encoder = encoder.to(self.device)
         self.main_model = main_model.to(self.device)
         
-        # Setup optimizer for both models
+        # 为主模型和可选 encoder 微调设置优化器
         if getattr(cfg, 'finetune_graph_autoencoder', False) and encoder_lr:
             self.optimizer = torch.optim.Adam([
                 {'params': self.main_model.parameters(), 'lr': lr},
@@ -47,7 +58,7 @@ class PreRoutFullClient:
             for p in group.get('params', [])
         }
 
-        # Optional lr scheduler (align with original cosine/exp decay, simplified to exp if decay_rate!=1)
+        # 可选学习率调度器：为了与原始实现保持一致，这里简化为指数衰减版本
         self.scheduler = None
         decay = getattr(cfg, 'lr_decay_rate', 1.0)
         gap = getattr(cfg, 'gap_update_lr', 0)
@@ -61,7 +72,7 @@ class PreRoutFullClient:
         self.training = False
         self.num_samples = len(self.train_data)
 
-        # Task-level loss weights for multi-task balancing.
+        # 多任务损失权重，用于平衡 AT / slew / netdelay / celldelay 的训练影响
         default_loss_weights = {
             'AT': 1.0,
             'slew': 1.0,
@@ -78,7 +89,10 @@ class PreRoutFullClient:
         self.celldelay_loss_type = str(getattr(cfg, 'celldelay_loss_type', 'mse')).lower()
         self.celldelay_huber_beta = float(getattr(cfg, 'celldelay_huber_beta', 1.0))
 
-        # FedEDA: drift regularization weighted by circuit complexity (Rent's Rule)
+        # FedEDA 相关配置：
+        # trainer.py 会先调用 _fededa_init() 收集所有 client 的复杂度元数据，
+        # 再把全局 CM_max / CM_min 广播回来。当前 client 在本地训练时使用这些
+        # 信息，把电路复杂度映射成漂移正则强度。
         self.gamma_size = float(getattr(cfg, 'fededa_gamma_size', 0.0))
         self.gamma_p = float(getattr(cfg, 'fededa_gamma_p', 0.0))
         self.fededa_reg_scale = float(getattr(cfg, 'fededa_reg_scale', 1.0))
@@ -102,25 +116,28 @@ class PreRoutFullClient:
         self._size_source_reported = False
         self._cm_source_reported = False
         self._fededa_enabled = (self.gamma_size > 0 or self.gamma_p > 0)
-        self.global_encoder_state = None  # global model state from server (for drift)
+        self.global_encoder_state = None  # 来自 server 的全局 encoder 状态（用于计算漂移）
         self.global_model_state = None
         self.circuit_metadata = {}        # {circuit_name: {size, p}}
         self.design_metadata = {}         # {design_name: {size, p}}
-        self.cm_max = None                # global CM bounds broadcast from server
+        self.cm_max = None                # server 广播的全局复杂度上界
         self.cm_min = None
-        self._alpha_values = {}           # {circuit_name: {size, p}} inverse-normalized
+        self._alpha_values = {}           # {circuit_name: {size, p}} 反向归一化后的 alpha
 
-        # FL algorithm selection for baseline comparison
+        # FL 算法选择：
+        # - fedavg: 仅做参数平均
+        # - fedprox: 额外加统一强度的模型漂移惩罚
+        # - scaffold: 用控制变量修正梯度方向
         self.fl_algorithm = str(getattr(cfg, 'fl_algorithm', 'fedavg')).lower()
         if self.fl_algorithm not in ('fedavg', 'fedprox', 'scaffold'):
             self.fl_algorithm = 'fedavg'
 
-        # FedProx: L = L_task + (mu/2) * ||w - w_global||^2
+        # FedProx：L = L_task + (mu/2) * ||w - w_global||^2
         self.fedprox_mu = float(getattr(cfg, 'fedprox_mu', 0.0))
         self.fedprox_drift_normalize = bool(getattr(cfg, 'fedprox_drift_normalize', True))
         self._fedprox_enabled = (self.fl_algorithm == 'fedprox' and self.fedprox_mu > 0.0)
 
-        # SCAFFOLD control variates
+        # SCAFFOLD 控制变量
         self._scaffold_enabled = (self.fl_algorithm == 'scaffold')
         self.scaffold_local_encoder_control = {}
         self.scaffold_local_model_control = {}
@@ -129,6 +146,9 @@ class PreRoutFullClient:
         if self._scaffold_enabled:
             self.init_scaffold_local_control()
 
+    # -------------------------------------------------
+    # 通用工具函数：权重、命名规整、状态迁移
+    # -------------------------------------------------
     def _task_weight(self, task_name):
         try:
             return float(self.loss_weights.get(task_name, 1.0))
@@ -188,6 +208,9 @@ class PreRoutFullClient:
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device)
 
+    # -------------------------------------------------
+    # FedEDA 元数据读取：优先读取离线预计算的 size / p（创新： client 端读取 size/p 预计算结果）
+    # -------------------------------------------------
     def _load_size_lookup_from_csv(self, csv_path, size_column):
         if not csv_path:
             return {}
@@ -281,7 +304,7 @@ class PreRoutFullClient:
         return float(fallback_nodes), False
 
     def _get_edge_index(self, g):
-        """Return (n, u, v) edge index on CPU for both homo/hetero DGL graphs."""
+        """在 CPU 上返回同构图/异构图统一格式的边索引 (n, u, v)。"""
         try:
             n = int(g.num_nodes())
         except Exception:
@@ -306,9 +329,10 @@ class PreRoutFullClient:
             return n, empty, empty
 
     def _estimate_p_topo_cut_fit(self, n, u, v, topo):
-        """Approximate Rent's p by fitting log(cut terminals) vs log(block size).
+        """近似估计 Rent 的 p。
 
-        Uses topology-level prefix partitions as lightweight hierarchical cuts.
+        方法是用拓扑层级前缀划分近似不同尺度的分块，
+        再拟合 log(切边终端数) 对 log(分块规模) 的斜率。
         """
         if n <= 2 or u.numel() == 0 or not topo:
             return None
@@ -351,18 +375,20 @@ class PreRoutFullClient:
             return None
         return min(1.0, max(0.0, float(slope)))
 
-    # ------------------------------------------------------------------
-    # FedEDA: circuit metadata & drift regularization
-    # Reference: FedEDA (DAC 2025) — Eq.(6), Algorithm 1
-    # ------------------------------------------------------------------
+    # -------------------------------------------------
+    # 电路复杂度元数据与自适应漂移正则(核心)
+    # -------------------------------------------------
+    # 这一段和 scripts/compute_fededa_cm_from_verilog.py 是直接关联的：
+    # - 预计算脚本负责离线生成 design -> {size, p}；
+    # - 本文件优先读取这些预计算结果；
 
-    def compute_circuit_metadata(self):
-        """Compute per-sample CM(size,p), preferring precomputed netlist metadata.
+    def compute_circuit_metadata(self):#创新：client 端统计自己持有电路的复杂度元数据
+        """计算每个样本的复杂度元数据 CM(size, p)，优先使用离线预计算结果。
 
-        Priority:
-        1) JSON precomputed CM (size/p).
-        2) Size CSV for size.
-        3) Graph-based p approximation fallback (legacy).
+        优先级：
+        1) 预计算 JSON 中的 size / p；
+        2) size CSV 中的 size；
+        3) 图上的 p 近似估计作为回退方案。
         """
         metadata = {}
         design_metadata = {}
@@ -377,6 +403,7 @@ class PreRoutFullClient:
         p_json_hit = 0
         p_fallback = 0
 
+        # 遍历本 client 的全部训练电路，得到每个电路的复杂度元数据。
         for name, (g, ts) in self.train_data.items():
             design_key = self._normalize_design_name(name) or str(name)
             per_design_samples.setdefault(design_key, []).append(name)
@@ -391,6 +418,10 @@ class PreRoutFullClient:
                 size_miss += 1
             per_design_size_candidates.setdefault(design_key, []).append(float(size_val))
 
+            # p 的优先级：
+            # 1) 预计算 JSON；
+            # 2) 图上近似 Rent 拟合；
+            # 3) 边节点比率近似。
             p_est, hit_p_json = self._resolve_cm_value(name, 'p')
             if hit_p_json:
                 p_json_hit += 1
@@ -461,7 +492,7 @@ class PreRoutFullClient:
         return metadata
 
     def get_circuit_metadata_summary(self):
-        """Return aggregated CM {size, p} for server to compute global bounds."""
+        """返回聚合后的 CM {size, p}，供 server 计算全局上下界。"""
         if not self.circuit_metadata:
             self.compute_circuit_metadata()
         vals = list(self.design_metadata.values()) if self.design_metadata else list(self.circuit_metadata.values())
@@ -471,17 +502,18 @@ class PreRoutFullClient:
         }
 
     def get_circuit_metadata_values(self):
-        """Return per-circuit CM values for global circuit-level CM bounds."""
+        """返回逐电路的 CM 值，供 server 计算全局电路级上下界。"""
         if not self.circuit_metadata:
             self.compute_circuit_metadata()
         return list(self.design_metadata.values()) if self.design_metadata else list(self.circuit_metadata.values())
 
-    def set_cm_bounds(self, cm_max, cm_min):
-        """Receive global CM bounds from server and precompute per-circuit alpha values.
+    def set_cm_bounds(self, cm_max, cm_min): #创新： client 端把 size/p 变成 alpha，再加到本地正则
+        """接收 server 的全局复杂度上下界，并预计算每个电路的 alpha。
 
-        FedEDA inverse min-max normalization:
+        FedEDA 使用反向 min-max 归一化：
             alpha = (CM_max - CM_min) / (CM - CM_min)
-        Small/simple circuits get large alpha → stronger drift penalty.
+        规模更小、结构更简单的电路会得到更大的 alpha，
+        从而在本地训练时受到更强的漂移惩罚。
         """
         self.cm_max = cm_max
         self.cm_min = cm_min
@@ -490,7 +522,7 @@ class PreRoutFullClient:
 
         def _inv_minmax(val, vmax, vmin):
             if abs(float(vmax) - float(vmin)) < 1e-8:
-                return 1.0  # all circuits equal → uniform weight
+                return 1.0  # 如果所有电路复杂度相同，则统一赋权
             denom = max(1e-8, float(val) - float(vmin))
             alpha = (float(vmax) - float(vmin)) / denom
             if self.fededa_alpha_clip_max > 0:
@@ -504,13 +536,16 @@ class PreRoutFullClient:
                 'p':     _inv_minmax(cm['p'],     cm_max['p'],     cm_min['p']),
             }
 
+    # -------------------------------------------------
+    # 联邦算法状态同步：接收来自 trainer.py 的全局模型 / 控制变量
+    # -------------------------------------------------
     def set_global_state(self, encoder_state, model_state):
-        """Store aggregated global state w_t for FedEDA drift regularization."""
+        """保存聚合后的全局状态 w_t，供 FedEDA/FedProx 计算漂移项。"""
         self.global_encoder_state = copy.deepcopy(encoder_state) if encoder_state is not None else None
         self.global_model_state = copy.deepcopy(model_state) if model_state is not None else None
 
     def init_scaffold_local_control(self):
-        """Initialize local SCAFFOLD control variates c_i with zeros."""
+        """将本地 SCAFFOLD 控制变量 c_i 初始化为全零。"""
         self.scaffold_local_encoder_control = {}
         self.scaffold_local_model_control = {}
 
@@ -526,7 +561,7 @@ class PreRoutFullClient:
                 )
 
     def set_scaffold_global_control(self, encoder_control, model_control):
-        """Receive server control variates c for SCAFFOLD."""
+        """接收 server 端的 SCAFFOLD 控制变量 c。"""
         if not self._scaffold_enabled:
             return
 
@@ -550,7 +585,7 @@ class PreRoutFullClient:
             self.scaffold_global_model_control[name] = src.detach().cpu().float().clone()
 
     def _compute_model_drift(self, normalize=True):
-        """||w_global - w_local||² (differentiable w.r.t. local parameters)."""
+        """计算 ||w_global - w_local||²，对本地参数保持可微。"""
         if self.global_model_state is None:
             return torch.zeros([], device=self.device)
         drift = torch.zeros([], device=self.device)
@@ -572,7 +607,7 @@ class PreRoutFullClient:
         return drift
 
     def _apply_scaffold_grad_correction(self):
-        """Apply SCAFFOLD gradient correction: grad <- grad + (c - c_i)."""
+        """应用 SCAFFOLD 梯度修正：grad <- grad + (c - c_i)。"""
         if not self._scaffold_enabled:
             return
 
@@ -595,7 +630,7 @@ class PreRoutFullClient:
             param.grad = param.grad + (c_global.to(self.device) - c_local.to(self.device))
 
     def _update_scaffold_local_control(self, local_steps):
-        """Update client control variates c_i and return delta for server c update."""
+        """更新客户端控制变量 c_i，并返回给 server 用于更新 c 的增量。"""
         if (not self._scaffold_enabled) or self.global_model_state is None or local_steps <= 0:
             return None
 
@@ -650,20 +685,23 @@ class PreRoutFullClient:
 
         return {'encoder': delta_encoder, 'model': delta_model}
 
+    # -------------------------------------------------
+    # 模型状态与训练状态导出/恢复
+    # -------------------------------------------------
     def load_state(self, encoder_state, model_state):
-        """Load both encoder and main model states"""
+        """加载 encoder 和主模型两套参数。"""
         self.encoder.load_state_dict(encoder_state)
         self.main_model.load_state_dict(model_state)
 
     def get_state(self):
-        """Return both encoder and main model states"""
+        """返回 encoder 和主模型两套参数。"""
         return {
             'encoder': self.encoder.state_dict(),
             'model': self.main_model.state_dict()
         }
 
     def export_training_state(self):
-        """Export full local training state for checkpoint/resume."""
+        """导出完整本地训练状态，供 checkpoint 保存与恢复。"""
         return {
             'state': self._to_cpu_state(self.get_state()),
             'optimizer': self._to_cpu_state(self.optimizer.state_dict()),
@@ -682,7 +720,7 @@ class PreRoutFullClient:
         }
 
     def load_training_state(self, payload):
-        """Restore full local training state from checkpoint payload."""
+        """从 checkpoint 载荷中恢复完整本地训练状态。"""
         if not isinstance(payload, dict):
             return
 
@@ -723,20 +761,24 @@ class PreRoutFullClient:
         self.cm_min = copy.deepcopy(payload.get('cm_min'))
         self._alpha_values = copy.deepcopy(payload.get('alpha_values', {}))
 
+    # client 前向主链（核心）
     def _forward_with_encoder(self, g, ts):
         """
-        Forward pass with graph autoencoder + main model
-        Returns: netdelay_pred, celldelay_pred, AT_slew_pred, targets, g (on device)
+        执行 encoder + 主模型的完整前向。
+
+        返回：
+        - netdelay_pred, celldelay_pred, AT_slew_pred
+        - 各任务真值 targets
+        - 已移动到当前设备上的图 g
         """
-        # Step 0: Move g to device first
         g = g.to(self.device)
         
-        # Step 1: Run encoder on homo graph to get latent embeddings
+        # 第 1 步：在 homo 图上运行 encoder，提取节点潜在表示 latent
         homo_graph = ts['homo']
         homo_graph = homo_graph.to(self.device)
         nf_homo = homo_graph.ndata['nf']
         
-        # Move ts dict to device (recursively handle nested structures)
+        # 将 ts 字典递归移动到设备上，兼容其中的嵌套张量/列表/字典
         def to_device_recursive(obj, device):
             if isinstance(obj, torch.Tensor):
                 return obj.to(device)
@@ -755,14 +797,12 @@ class PreRoutFullClient:
             latent = self.encoder(homo_graph, nf_homo)
             global_embedding = latent.mean(dim=0).expand_as(latent)
             
-            # Step 2: Concatenate latent + global embedding to hetero graph node features
+            # 第 2 步：将节点级表示 latent 和图级表示 global_embedding
+            # 将 original_nf + latent + global_embedding 拼接为新的节点特征，供主模型做时序预测。
             original_nf = g.ndata['nf']
             g.ndata['nf'] = torch.cat([original_nf, latent, global_embedding], dim=1)
             
-            # Step 3: Forward through main PreRoutGNN model
-            # Match original PreRoutGNN behavior:
-            # - training: configurable groundtruth teacher forcing
-            # - evaluation: always groundtruth=False
+            # 第 3 步：送入主模型做时序预测
             use_groundtruth = getattr(self.cfg, 'groundtruth', True) if self.training else False
             netdelay_pred, celldelay_pred, AT_slew_pred = self.main_model(
                 g,
@@ -770,27 +810,29 @@ class PreRoutFullClient:
                 groundtruth=use_groundtruth
             )
             
-            # Step 4: Get ground truth targets
+            # 第 4 步：提取各任务的真实标签
             AT_truth = g.ndata['n_atslew'][:, 0:4]
             slew_truth = g.ndata['n_atslew'][:, 4:8] if getattr(self.cfg, 'predict_slew', True) else None
             netdelay_truth = g.ndata['n_net_delays_log'] if getattr(self.cfg, 'predict_netdelay', True) else None
             celldelay_truth = g.edges['cell_out'].data['e_cell_delays'] if getattr(self.cfg, 'predict_celldelay', True) else None
             
-            # Restore original node features
+            # 恢复原始节点特征，避免污染后续流程
             g.ndata['nf'] = original_nf
             
         return netdelay_pred, celldelay_pred, AT_slew_pred, (AT_truth, slew_truth, netdelay_truth, celldelay_truth), g
 
+    # -------------------------------------------------
+    # 多任务损失与指标
+    # -------------------------------------------------
     def _compute_loss(self, g, ts):
-        """Compute loss for AT, Slew, NetDelay, CellDelay"""
+        """计算 AT、Slew、NetDelay、CellDelay 的多任务损失。"""
         netdelay_pred, celldelay_pred, AT_slew_pred, (AT_truth, slew_truth, netdelay_truth, celldelay_truth), g = \
             self._forward_with_encoder(g, ts)
         
-        # Split AT and Slew predictions
         AT_pred = AT_slew_pred[:, 0:4]
         slew_pred = AT_slew_pred[:, 4:8] if getattr(self.cfg, 'predict_slew', True) else None
         
-        # Compute losses (with valid mask if present, now g is on device)
+        # 计算各任务损失；如果图上存在 valid mask，则只对有效节点计损失
         loss_AT = F.mse_loss(AT_pred, AT_truth, reduction='none').mean(dim=1)
         if g.ndata.get('valid') is not None:
             loss_AT = loss_AT * g.ndata['valid']
@@ -834,7 +876,7 @@ class PreRoutFullClient:
         return total_loss, losses
 
     def _compute_metrics(self, g, ts):
-        """Compute metrics using PreRoutGNN's metric functions: MSE, MAE, R² for each task"""
+        """用 PreRoutGNN 的指标函数计算各任务的 MSE、MAE、R²。"""
         netdelay_pred, celldelay_pred, AT_slew_pred, (AT_truth, slew_truth, netdelay_truth, celldelay_truth), g = \
             self._forward_with_encoder(g, ts)
         
@@ -843,34 +885,31 @@ class PreRoutFullClient:
         
         metrics = {}
         
-        # AT metrics using PreRoutGNN metric functions
         mse_AT = calc_mse(AT_truth, AT_pred).item()
         mae_AT = calc_mae(AT_truth, AT_pred).item()
         r2_AT = calc_r2_torch(AT_truth, AT_pred).item()
         metrics.update({'mse-AT': mse_AT, 'mae-AT': mae_AT, 'r2-AT': r2_AT})
-        
-        # Slew metrics
         if slew_pred is not None and slew_truth is not None:
             mse_slew = calc_mse(slew_truth, slew_pred).item()
             mae_slew = calc_mae(slew_truth, slew_pred).item()
             r2_slew = calc_r2_torch(slew_truth, slew_pred).item()
             metrics.update({'mse-slew': mse_slew, 'mae-slew': mae_slew, 'r2-slew': r2_slew})
         
-        # NetDelay metrics
+        # NetDelay 指标
         if netdelay_pred is not None and netdelay_truth is not None:
             mse_netdelay = calc_mse(netdelay_truth, netdelay_pred).item()
             mae_netdelay = calc_mae(netdelay_truth, netdelay_pred).item()
             r2_netdelay = calc_r2_torch(netdelay_truth, netdelay_pred).item()
             metrics.update({'mse-netdelay': mse_netdelay, 'mae-netdelay': mae_netdelay, 'r2-netdelay': r2_netdelay})
         
-        # CellDelay metrics
+        # CellDelay 指标
         if celldelay_pred is not None and celldelay_truth is not None:
             mse_celldelay = calc_mse(celldelay_truth, celldelay_pred).item()
             mae_celldelay = calc_mae(celldelay_truth, celldelay_pred).item()
             r2_celldelay = calc_r2_torch(celldelay_truth, celldelay_pred).item()
             metrics.update({'mse-celldelay': mse_celldelay, 'mae-celldelay': mae_celldelay, 'r2-celldelay': r2_celldelay})
         
-        # Overall metrics (average of all tasks)
+        # 总体指标：对各任务指标做平均
         mse_overall = sum([v for k, v in metrics.items() if k.startswith('mse-')]) / len([k for k in metrics if k.startswith('mse-')])
         mae_overall = sum([v for k, v in metrics.items() if k.startswith('mae-')]) / len([k for k in metrics if k.startswith('mae-')])
         r2_overall = sum([v for k, v in metrics.items() if k.startswith('r2-')]) / len([k for k in metrics if k.startswith('r2-')])
@@ -878,6 +917,10 @@ class PreRoutFullClient:
         
         return metrics
 
+    # -------------------------------------------------
+    # 本地训练：任务损失 + 联邦正则 + 参数更新
+    # -------------------------------------------------
+    # 这是 trainer.py 每轮调用 client.train_local() 时真正发生梯度更新的地方。
     def train_epoch(self):
         if len(self.train_data) == 0:
             return 0.0, {}, {'task_loss': 0.0, 'reg_loss': 0.0, 'local_steps': 0}
@@ -897,6 +940,8 @@ class PreRoutFullClient:
             task_loss_total += loss.item()
             total_step_loss = loss
 
+            # FedEDA：按电路复杂度自适应调节漂移正则强度。
+            # 这里使用的 alpha 值来自 trainer.py -> _fededa_init() 广播的全局范围。
             if self._fededa_enabled and self.global_model_state is not None and self._alpha_values:
                 alpha = self._alpha_values.get(circuit_name, {})
                 lambda_reg = (
@@ -915,6 +960,7 @@ class PreRoutFullClient:
                         reg_loss_total += reg.item()
                         total_step_loss = total_step_loss + reg
 
+            # FedProx：与 FedEDA 相比，它对所有电路施加统一强度的漂移惩罚。
             if self._fedprox_enabled and self.global_model_state is not None:
                 prox_drift = self._compute_model_drift(normalize=self.fedprox_drift_normalize)
                 if prox_drift.item() > 0:
@@ -925,6 +971,7 @@ class PreRoutFullClient:
             total_loss += total_step_loss.item()
             total_step_loss.backward()
 
+            # SCAFFOLD：在反向传播后、参数更新前，对梯度做控制变量修正。
             if self._scaffold_enabled:
                 self._apply_scaffold_grad_correction()
 
@@ -954,6 +1001,9 @@ class PreRoutFullClient:
         }
         return total_loss / num, avg_losses, train_parts
 
+    # -------------------------------------------------
+    # 本地评估与 trainer.py 的交互出口
+    # -------------------------------------------------
     @torch.no_grad()
     def test_epoch(self):
         if len(self.test_data) == 0:
@@ -973,7 +1023,7 @@ class PreRoutFullClient:
             for k, v in losses.items():
                 losses_sum[k] = losses_sum.get(k, 0.0) + v
             
-            # Compute metrics
+            # 计算评估指标
             metrics = self._compute_metrics(g, ts)
             for k, v in metrics.items():
                 metrics_sum[k] = metrics_sum.get(k, 0.0) + v
@@ -984,6 +1034,13 @@ class PreRoutFullClient:
         return total_loss / num, avg_losses, avg_metrics
 
     def train_local(self, local_epochs):
+        # trainer.py 在每轮联邦训练时调用这里。
+        # 返回内容包括：
+        # - 当前 client 的双模型参数 state
+        # - 本地训练/验证损失
+        # - 多任务评估指标
+        # - 样本数 num_samples（供 FedAvg 加权）
+        # - scaffold_delta_control（供 SCAFFOLD 更新 server control）
         local_train_loss = 0.0
         local_train_task_loss = 0.0
         local_train_reg_loss = 0.0

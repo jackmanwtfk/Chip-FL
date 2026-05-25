@@ -13,7 +13,11 @@ from .Ampere.distributed.client_trainer import AmpereClientTrainer
 from .Ampere.distributed.server_trainer import AmpereServerTrainer
 
 from .PreRout.trainer import PreRoutFedTrainer
-from .FedEDA.trainer import FedEDATrainer
+
+try:
+    from .FedEDA.trainer import FedEDATrainer
+except ModuleNotFoundError:
+    FedEDATrainer = None
 
 
 __all__ = [
@@ -32,5 +36,7 @@ __all__ = [
     'AmpereServerTrainer',
 
     'PreRoutFedTrainer',
-    'FedEDATrainer'
 ]
+
+if FedEDATrainer is not None:
+    __all__.append('FedEDATrainer')
